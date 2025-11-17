@@ -521,3 +521,155 @@ if st.session_state.last_plan:
         )
 else:
     st.info("Click **Build 3-meal plan** in the sidebar to generate a plan under your constraints.")
+
+# =========================
+# Section 4: Analytics & Insights
+# =========================
+# Visuals on the retrieved set and the current plan:
+# - Boxplots for kcal / macros on top hits
+# - Histogram of kcal distribution
+# - Protein vs kcal scatter (quality view)
+# - Macro fit: plan vs targets
+# - Sodium & sugar vs caps
+
+import altair as alt
+
+st.markdown("---")
+st.header("📈 Analytics & Insights")
+
+# ------- Build a compact hits DataFrame (first 200 for speed/clarity) -------
+def _hits_df(hits: list[dict], limit: int = 200) -> pd.DataFrame:
+    rows = []
+    for h in hits[:limit]:
+        n = h.get("nutrients_total", {}) or {}
+        rows.append({
+            "title": h.get("title"),
+            "score": _num(h.get("score")),
+            "kcal": _num(n.get("kcal")),
+            "protein_g": _num(n.get("protein_g")),
+            "fat_g": _num(n.get("fat_g")),
+            "carb_g": _num(n.get("carb_g")),
+            "sugar_g": _num(n.get("sugar_g")),
+            "sodium_mg": _num(n.get("sodium_mg")),
+        })
+    df = pd.DataFrame(rows)
+    # Filter out totally empty rows for cleaner charts
+    if not df.empty:
+        df = df.replace([np.inf, -np.inf], np.nan).dropna(how="all", subset=["kcal","protein_g","fat_g","carb_g"])
+    return df
+
+df_hits = _hits_df(st.session_state.last_hits, limit=200)
+
+# ------- Subsection: Retrieved set visuals -------
+st.subheader("🔎 Retrieved Set (top candidates)")
+
+if not df_hits.empty:
+    # Boxplots for kcal/protein/fat/carb
+    melt = df_hits.melt(value_vars=["kcal","protein_g","fat_g","carb_g"], var_name="nutrient", value_name="value")
+    box = (
+        alt.Chart(melt.dropna())
+        .mark_boxplot()
+        .encode(
+            x=alt.X("nutrient:N", title="Nutrient"),
+            y=alt.Y("value:Q", title="Value"),
+            color=alt.Color("nutrient:N", legend=None),
+        )
+        .properties(height=280)
+    )
+
+    # kcal histogram
+    hist = (
+        alt.Chart(df_hits.dropna(subset=["kcal"]))
+        .mark_bar()
+        .encode(
+            x=alt.X("kcal:Q", bin=alt.Bin(maxbins=30), title="Energy (kcal)"),
+            y=alt.Y("count():Q", title="Count"),
+        )
+        .properties(height=220)
+    )
+
+    # protein vs kcal scatter colored by similarity score
+    scatter = (
+        alt.Chart(df_hits.dropna(subset=["kcal","protein_g"]))
+        .mark_circle(size=60, opacity=0.7)
+        .encode(
+            x=alt.X("kcal:Q", title="Energy (kcal)"),
+            y=alt.Y("protein_g:Q", title="Protein (g)"),
+            color=alt.Color("score:Q", title="Retrieval score"),
+            tooltip=["title","kcal","protein_g","fat_g","carb_g","sodium_mg","score"],
+        )
+        .interactive()
+        .properties(height=280)
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(box, use_container_width=True)
+    with c2:
+        st.altair_chart(hist, use_container_width=True)
+
+    st.altair_chart(scatter, use_container_width=True)
+else:
+    st.info("Retrieve some candidates first to see dataset visuals.")
+
+# ------- Subsection: Plan vs Targets -------
+st.subheader("🗓️ Plan vs Targets")
+
+plan = st.session_state.last_plan
+targets = current_targets
+
+if plan:
+    totals = plan["totals"]
+    # Macro comparison
+    df_macros = pd.DataFrame([
+        {"type": "Target", "kcal": targets["calories"], "protein_g": targets["protein_g"], "fat_g": targets["fat_g"], "carb_g": targets["carb_g"]},
+        {"type": "Plan",   "kcal": totals["kcal"],       "protein_g": totals["protein_g"], "fat_g": totals["fat_g"], "carb_g": totals["carb_g"]},
+    ])
+    macros_melt = df_macros.melt(id_vars=["type"], value_vars=["kcal","protein_g","fat_g","carb_g"],
+                                 var_name="metric", value_name="value")
+
+    bars = (
+        alt.Chart(macros_melt)
+        .mark_bar()
+        .encode(
+            x=alt.X("metric:N", title=""),
+            y=alt.Y("value:Q", title="Amount"),
+            color=alt.Color("type:N", title="", scale=alt.Scale(scheme="set2")),
+            column=alt.Column("type:N", header=alt.Header(labelOrient="bottom")),
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(bars, use_container_width=True)
+
+    # Sodium & sugar vs caps
+    caps = st.session_state.caps
+    df_caps = pd.DataFrame([
+        {"metric": "Sodium (mg)", "value": totals.get("sodium_mg", 0.0), "cap": caps["max_sodium_mg"]},
+        {"metric": "Sugar (g)",   "value": totals.get("sugar_g", 0.0),   "cap": caps["max_sugar_g"]},
+    ])
+    # Two side-by-side bars with conditional color if exceeding cap
+    for _, row in df_caps.iterrows():
+        metric = row["metric"]
+        value = float(row["value"] or 0)
+        cap   = float(row["cap"] or 0)
+        pct = (value / cap) if cap > 0 else 0.0
+
+        st.markdown(f"**{metric}** — {int(value)} / {int(cap)} ( {pct*100:.0f}% of cap )")
+        df_bar = pd.DataFrame({"label": [metric, "Cap"], "amount": [value, cap]})
+        chart = (
+            alt.Chart(df_bar)
+            .mark_bar()
+            .encode(
+                x=alt.X("label:N", title=""),
+                y=alt.Y("amount:Q", title="Amount"),
+                color=alt.Color("label:N", legend=None,
+                                scale=alt.Scale(domain=[metric,"Cap"], range=["#e66101","#5e3c99"])),
+                tooltip=["label","amount"]
+            )
+            .properties(height=180)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+else:
+    st.info("Build a plan to compare against your targets and caps.")
+
