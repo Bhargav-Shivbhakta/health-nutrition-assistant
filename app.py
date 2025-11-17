@@ -359,3 +359,165 @@ def strict_plan_from_hits(
 
     return best
 
+# =========================
+# Section 3: UI state & sidebar
+# =========================
+# - Initializes session state (last_hits, last_plan, profile, targets, caps)
+# - Sidebar collects user profile, computes TDEE & macro targets
+# - Lets user set hard caps and search intent
+# - Buttons to run retrieval and build the deterministic plan
+# - Stores results into st.session_state for later sections
+
+# ------- Session state boot -------
+if "last_hits" not in st.session_state:
+    st.session_state.last_hits: list[dict] = []
+if "last_plan" not in st.session_state:
+    st.session_state.last_plan: dict | None = None
+if "profile" not in st.session_state:
+    st.session_state.profile = {
+        "age": 24,
+        "sex": "male",
+        "height_cm": 176,
+        "weight_kg": 72,
+        "activity": "moderate",   # sedentary, light, moderate, active, athlete
+        "goal": "maintain",       # maintain, loss, gain
+        "macro_style": "balanced" # balanced, high_protein, low_carb
+    }
+if "caps" not in st.session_state:
+    st.session_state.caps = {"max_sodium_mg": 2300, "max_sugar_g": 50, "max_meal_kcal": 1000}
+if "search" not in st.session_state:
+    st.session_state.search = {"intent": "balanced vegetarian high-protein", "k": 60}
+
+# ------- Sidebar layout -------
+with st.sidebar:
+    st.header("Your Profile")
+
+    colA, colB = st.columns(2)
+    with colA:
+        age = st.number_input("Age", 14, 100, st.session_state.profile["age"], 1)
+        height_cm = st.number_input("Height (cm)", 120, 220, st.session_state.profile["height_cm"], 1)
+    with colB:
+        sex = st.selectbox("Sex", ["male", "female"], index=0 if st.session_state.profile["sex"]=="male" else 1)
+        weight_kg = st.number_input("Weight (kg)", 35, 200, st.session_state.profile["weight_kg"], 1)
+
+    activity = st.selectbox("Activity", ["sedentary","light","moderate","active","athlete"],
+                            index=["sedentary","light","moderate","active","athlete"].index(st.session_state.profile["activity"]))
+    goal = st.selectbox("Goal", ["maintain","loss","gain"],
+                        index=["maintain","loss","gain"].index(st.session_state.profile["goal"]))
+    macro_style = st.selectbox("Macro style", ["balanced","high_protein","low_carb"],
+                               index=["balanced","high_protein","low_carb"].index(st.session_state.profile["macro_style"]))
+
+    # Compute calorie target from TDEE & goal, then macro targets
+    base_cal = round(tdee_msj(age, sex, height_cm, weight_kg, activity))
+    if goal == "loss":
+        base_cal = round(base_cal * 0.85)
+    elif goal == "gain":
+        base_cal = round(base_cal * 1.10)
+    targets = macro_targets(base_cal, macro_style)
+
+    st.markdown("### Constraints")
+    max_sodium_mg = st.number_input("Max sodium (mg/day)", 0, 6000, st.session_state.caps["max_sodium_mg"], 50)
+    max_sugar_g   = st.number_input("Max sugar (g/day)", 0, 200, st.session_state.caps["max_sugar_g"], 1)
+    max_meal_kcal = st.number_input("Max kcal per meal", 400, 2000, st.session_state.caps["max_meal_kcal"], 50)
+
+    st.markdown("### Search")
+    intent = st.text_input("Intent / tags", st.session_state.search["intent"])
+    k = st.slider("Candidates (k)", 10, 150, st.session_state.search["k"], 10)
+
+    st.markdown("---")
+    col_btn1, col_btn2 = st.columns(2)
+    run_search = col_btn1.button("🔎 Retrieve")
+    run_plan   = col_btn2.button("🗓️ Build 3-meal plan")
+
+# ------- Persist sidebar values back into state -------
+st.session_state.profile.update({
+    "age": age, "sex": sex, "height_cm": height_cm, "weight_kg": weight_kg,
+    "activity": activity, "goal": goal, "macro_style": macro_style
+})
+st.session_state.caps.update({
+    "max_sodium_mg": int(max_sodium_mg),
+    "max_sugar_g": int(max_sugar_g),
+    "max_meal_kcal": int(max_meal_kcal),
+})
+st.session_state.search.update({"intent": intent, "k": int(k)})
+current_targets = targets  # keep a clear name for later sections
+
+# ------- Main header & disclaimer -------
+st.title("🥗 AI-Driven Health & Nutrition Assistant")
+st.caption(DISCLAIMER)
+
+# ------- Actions: retrieve & plan -------
+if run_search:
+    hits = search_recipes(intent, k)
+    st.session_state.last_hits = hits
+
+if run_plan:
+    if not st.session_state.last_hits:
+        # If user clicked plan first, retrieve implicitly
+        st.session_state.last_hits = search_recipes(intent, k)
+    plan = strict_plan_from_hits(
+        st.session_state.last_hits,
+        current_targets,
+        max_sodium_mg=st.session_state.caps["max_sodium_mg"],
+        max_sugar_g=st.session_state.caps["max_sugar_g"],
+        max_meal_kcal=st.session_state.caps["max_meal_kcal"],
+    )
+    st.session_state.last_plan = plan
+
+# ------- Quick status strip -------
+with st.container():
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Retrieved candidates", f"{len(st.session_state.last_hits):,}")
+    if st.session_state.last_plan:
+        tot = st.session_state.last_plan["totals"]
+        c2.metric("Day kcal (plan)", f"{int(tot['kcal'])}")
+        c3.metric("Protein (g)", f"{int(tot['protein_g'])}")
+    else:
+        c2.metric("Day kcal (plan)", "—")
+        c3.metric("Protein (g)", "—")
+
+# ------- Preview panels -------
+st.markdown("### 🔎 Search results (top 30)")
+if st.session_state.last_hits:
+    import pandas as pd
+    df_hits = pd.DataFrame([
+        {
+            "rank": i+1,
+            "title": h["title"],
+            "score": round(h["score"], 3),
+            "kcal": h["nutrients_total"].get("kcal"),
+            "protein_g": h["nutrients_total"].get("protein_g"),
+            "fat_g": h["nutrients_total"].get("fat_g"),
+            "carb_g": h["nutrients_total"].get("carb_g"),
+            "sugar_g": h["nutrients_total"].get("sugar_g"),
+            "sodium_mg": h["nutrients_total"].get("sodium_mg"),
+        } for i, h in enumerate(st.session_state.last_hits[:30])
+    ])
+    st.dataframe(df_hits, use_container_width=True, hide_index=True)
+else:
+    st.info("Click **Retrieve** in the sidebar to fetch candidates for your intent.")
+
+st.markdown("### 🏆 Current 3-meal plan")
+if st.session_state.last_plan:
+    import pandas as pd
+    df_plan = pd.DataFrame(st.session_state.last_plan["meals"])
+    st.dataframe(df_plan, use_container_width=True, hide_index=True)
+    st.markdown(f"**Day totals:** {st.session_state.last_plan['totals']}")
+    # Download buttons
+    cdl1, cdl2 = st.columns(2)
+    with cdl1:
+        st.download_button(
+            "⬇️ Download meals (CSV)",
+            df_plan.to_csv(index=False).encode("utf-8"),
+            file_name="plan_meals.csv",
+            mime="text/csv",
+        )
+    with cdl2:
+        st.download_button(
+            "⬇️ Download totals (JSON)",
+            json.dumps(st.session_state.last_plan["totals"], indent=2).encode("utf-8"),
+            file_name="plan_totals.json",
+            mime="application/json",
+        )
+else:
+    st.info("Click **Build 3-meal plan** in the sidebar to generate a plan under your constraints.")
