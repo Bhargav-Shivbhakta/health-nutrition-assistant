@@ -493,11 +493,11 @@ if st.session_state.page == "Home":
         with c1:
             if st.button("📊 Depth Analysis", use_container_width=True):
                 st.session_state.page = "Analysis"
-                st.experimental_rerun()
+                _RERUN()
         with c2:
             if st.button("🧑‍⚕️ Chat with AI Coach", use_container_width=True):
                 st.session_state.page = "Chat"
-                st.experimental_rerun()
+                _RERUN()
     else:
         st.info("Click **Build basic meal plan** to generate a plan under your constraints.")
 
@@ -727,7 +727,7 @@ if st.session_state.page == "Chat":
                         "Try: *“Build a high-protein vegetarian plan under 2300 mg sodium”* "
                         "or *“Swap dinner and keep the rest”*.")
             st.session_state.chat_msgs.append({"role":"assistant","content":user_msg})
-            st.experimental_rerun()
+            _RERUN()
 
         st.session_state.chat_msgs.append({"role":"user","content":user_msg})
         ctx = {
@@ -744,7 +744,7 @@ if st.session_state.page == "Chat":
         }
         reply = run_agent(user_msg, ctx)
         st.session_state.chat_msgs.append({"role":"assistant","content":reply})
-        st.experimental_rerun()
+        _RERUN()
 
 # ---------------------------
 # Small polish & footer
