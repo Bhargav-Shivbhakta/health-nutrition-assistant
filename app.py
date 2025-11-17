@@ -6,6 +6,20 @@
 # - LLM-based interpreter (with regex fallback) extracts profile, macro style, intent
 # - Auto-builds plan, then reveals sidebar for advanced tuning and analysis
 
+from __future__ import annotations
+
+import os
+import json
+import math
+import itertools
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+import faiss
+from sentence_transformers import SentenceTransformer
 def _openai_client_safe():
     try:
         from openai import OpenAI  # type: ignore
@@ -194,20 +208,7 @@ if not st.session_state.onboarded:
 # - Cached pipeline loader (model by name + FAISS + slim meta)
 # - Hard validation of artifacts so failures are obvious
 
-from __future__ import annotations
 
-import os
-import json
-import math
-import itertools
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
-import streamlit as st
-import numpy as np
-import pandas as pd
-import faiss
-from sentence_transformers import SentenceTransformer
 
 # ---- Streamlit page config (set this before anything renders)
 st.set_page_config(
