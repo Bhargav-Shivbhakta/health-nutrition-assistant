@@ -1,4 +1,192 @@
 # =========================
+# Section 0: Conversational Onboarding
+# =========================
+# - On first run, ask for user info & goal in main pane (not sidebar)
+# - Offer goal presets + example prompts
+# - LLM-based interpreter (with regex fallback) extracts profile, macro style, intent
+# - Auto-builds plan, then reveals sidebar for advanced tuning and analysis
+
+def _openai_client_safe():
+    try:
+        from openai import OpenAI  # type: ignore
+        if os.environ.get("OPENAI_API_KEY"):
+            return OpenAI()
+    except Exception:
+        pass
+    return None
+
+GOAL_PRESETS = [
+    "Weight loss, high-protein, low sodium",
+    "Muscle gain, high-protein, moderate carbs",
+    "Balanced diet for maintenance",
+    "Low-carb for blood sugar control",
+    "Heart-healthy (low sodium)",
+    "High-fiber vegetarian",
+    "Pescatarian high-protein",
+    "Dairy-free, high-protein",
+    "Gluten-free balanced",
+    "Plant-based endurance (higher carbs)",
+]
+
+EXAMPLE_PROMPTS = [
+    "I'm 24, male, 176 cm, 72 kg, moderately active. I want to lose ~10% weight in 3 months, high-protein vegetarian, low sodium.",
+    "Female, 165 cm, 60 kg, light activity. Maintain weight, Mediterranean style, keep sugar under 40 g.",
+    "Male, 180 cm, 82 kg, active. Muscle gain, avoid shellfish and peanuts, under 2300 mg sodium.",
+]
+
+def _coerce_sex(s: str) -> str:
+    s = (s or "").lower()
+    if "f" in s and "male" not in s: return "female"
+    return "male" if "m" in s else ("female" if "f" in s else "male")
+
+def _infer_activity(text: str) -> str:
+    t = (text or "").lower()
+    if "athlete" in t or "very active" in t: return "athlete"
+    if "active" in t: return "active"
+    if "moderate" in t: return "moderate"
+    if "light" in t or "lightly" in t: return "light"
+    return "moderate"
+
+def _infer_macro_style(text: str) -> str:
+    t = (text or "").lower()
+    if "high-protein" in t or "high protein" in t: return "high_protein"
+    if "low-carb" in t or "low carb" in t: return "low_carb"
+    return "balanced"
+
+def _parse_numbers(text: str):
+    import re
+    # crude, resilient extraction
+    age = next((int(x) for x in re.findall(r"\b(\d{2})\b", text) if 14 <= int(x) <= 99), 24)
+    cm  = next((int(x) for x in re.findall(r"(\d{3})\s*cm", text.lower())), 176)
+    kg  = next((int(x) for x in re.findall(r"(\d{2,3})\s*kg", text.lower())), 72)
+    return age, cm, kg
+
+def interpret_onboarding(free_text: str, preset: str | None) -> dict:
+    """
+    Returns a dict with:
+      profile: {age, sex, height_cm, weight_kg, activity, goal, macro_style}
+      caps:    {max_sodium_mg, max_sugar_g, max_meal_kcal}
+      search:  {intent, k}
+    Uses LLM if available; otherwise, uses resilient heuristics.
+    """
+    # Defaults
+    profile = {
+        "age": 24, "sex": "male", "height_cm": 176, "weight_kg": 72,
+        "activity": "moderate", "goal": "maintain", "macro_style": "balanced"
+    }
+    caps = {"max_sodium_mg": 2300, "max_sugar_g": 50, "max_meal_kcal": 1000}
+    search = {"intent": "balanced high-protein vegetarian", "k": 60}
+
+    client = _openai_client_safe()
+    if client:
+        try:
+            system = (
+                "Extract nutrition planning parameters from the user text. "
+                "Return strict JSON with keys: profile{age:int,sex:str,height_cm:int,weight_kg:int,"
+                "activity in [sedentary,light,moderate,active,athlete], goal in [maintain,loss,gain],"
+                "macro_style in [balanced,high_protein,low_carb]}, "
+                "caps{max_sodium_mg:int,max_sugar_g:int,max_meal_kcal:int}, "
+                "search{intent:str,k:int}. Keep intent short (3-8 tags)."
+            )
+            prompt = free_text + ("\n\nPreset: " + preset if preset else "")
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
+                temperature=0.1
+            )
+            import json as _json
+            parsed = _json.loads(r.choices[0].message.content)
+            profile.update(parsed.get("profile", {}))
+            caps.update(parsed.get("caps", {}))
+            search.update(parsed.get("search", {}))
+            # sanitize
+            profile["sex"] = _coerce_sex(profile.get("sex","male"))
+            profile["activity"] = profile.get("activity","moderate")
+            profile["goal"] = profile.get("goal","maintain")
+            profile["macro_style"] = profile.get("macro_style","balanced")
+            search["k"] = int(search.get("k",60))
+            return {"profile":profile,"caps":caps,"search":search}
+        except Exception:
+            pass  # fall back
+
+    # ---- Heuristic fallback (no API key / LLM error) ----
+    t = (free_text or "") + (" " + (preset or ""))
+    age, cm, kg = _parse_numbers(t)
+    profile.update({
+        "age": age,
+        "sex": _coerce_sex(t),
+        "height_cm": cm,
+        "weight_kg": kg,
+        "activity": _infer_activity(t),
+        "goal": ("loss" if "loss" in t or "cut" in t else ("gain" if "gain" in t or "bulk" in t else "maintain")),
+        "macro_style": _infer_macro_style(t),
+    })
+    if "low sodium" in t or "heart" in t: caps["max_sodium_mg"] = 2000
+    if "low sugar" in t: caps["max_sugar_g"] = 40
+    if "small meals" in t: caps["max_meal_kcal"] = 800
+    # intent seeds
+    intent_bits = []
+    if "vegetarian" in t or "veggie" in t: intent_bits.append("vegetarian")
+    if "vegan" in t: intent_bits.append("vegan")
+    if "pescatarian" in t: intent_bits.append("pescatarian")
+    if profile["macro_style"] == "high_protein": intent_bits.append("high-protein")
+    if profile["macro_style"] == "low_carb": intent_bits.append("low-carb")
+    if "gluten" in t: intent_bits.append("gluten-free")
+    if not intent_bits: intent_bits = ["balanced"]
+    search.update({"intent": " ".join(sorted(set(intent_bits))), "k": 60})
+    return {"profile":profile,"caps":caps,"search":search}
+
+# ---------- Onboarding UI ----------
+if "onboarded" not in st.session_state:
+    st.session_state.onboarded = False
+
+if not st.session_state.onboarded:
+    st.title("🥗 AI-Driven Health & Nutrition Assistant")
+    st.caption(DISCLAIMER)
+
+    st.subheader("Tell me about you and your goal")
+    st.write("You can either pick a preset **or** just write freely. I’ll interpret and build a plan.")
+    pres = st.pills("Quick presets", GOAL_PRESETS, selection_mode="single") if hasattr(st, "pills") else st.selectbox("Quick presets", ["(none)"] + GOAL_PRESETS)
+    preset = None if (isinstance(pres, str) and pres == "(none)") else (pres if isinstance(pres,str) else (pres[0] if pres else None))
+
+    st.markdown("**Examples**")
+    for ex in EXAMPLE_PROMPTS:
+        st.code(ex)
+
+    free = st.text_area("Type here", height=140, placeholder=EXAMPLE_PROMPTS[0])
+
+    c1, c2 = st.columns([1,3])
+    with c1:
+        go = st.button("Create my plan", type="primary")
+    with c2:
+        st.caption("I’ll compute calories/macros, retrieve recipes, and assemble a 3-meal plan under sensible caps.")
+
+    if go:
+        parsed = interpret_onboarding(free.strip() or EXAMPLE_PROMPTS[0], preset)
+        # write into session state used by later sections
+        st.session_state.profile = parsed["profile"]
+        st.session_state.caps    = parsed["caps"]
+        st.session_state.search  = parsed["search"]
+        # compute targets
+        p = st.session_state.profile
+        base_cal = round(tdee_msj(p["age"], p["sex"], p["height_cm"], p["weight_kg"], p["activity"]))
+        if p["goal"] == "loss": base_cal = round(base_cal * 0.85)
+        if p["goal"] == "gain": base_cal = round(base_cal * 1.10)
+        st.session_state.targets = macro_targets(base_cal, p["macro_style"])
+        # retrieve + plan immediately
+        st.session_state.last_hits = search_recipes(st.session_state.search["intent"], st.session_state.search["k"])
+        st.session_state.last_plan = strict_plan_from_hits(
+            st.session_state.last_hits,
+            st.session_state.targets,
+            max_sodium_mg=st.session_state.caps["max_sodium_mg"],
+            max_sugar_g=st.session_state.caps["max_sugar_g"],
+            max_meal_kcal=st.session_state.caps["max_meal_kcal"],
+        )
+        st.session_state.onboarded = True
+        st.experimental_rerun()
+
+
+# =========================
 # Section 1: Bootstrapping
 # =========================
 # - Imports & Streamlit page config
