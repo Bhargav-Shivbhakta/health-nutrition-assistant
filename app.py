@@ -159,3 +159,203 @@ with st.expander("Artifacts (resolved)", expanded=False):
     st.write("FAISS :", f"{cfg.get('_resolved_faiss')} ({cfg.get('_faiss_size')})")
     st.write("Meta  :", f"{cfg.get('_resolved_meta')} ({cfg.get('_meta_size')})")
     st.write("Model :", cfg.get("_model_name"))
+
+
+# =========================
+# Section 2: Core utilities
+# =========================
+# - encode_query / search_recipes: semantic retrieval via your FAISS index
+# - tdee_msj / macro_targets: daily energy and macro targets
+# - strict_plan_from_hits: deterministic 3-meal selector with hard constraints
+# - Helper scoring & number parsing utilities
+
+from typing import Iterable
+
+# -------- Retrieval --------
+def encode_query(model: SentenceTransformer, text: str) -> np.ndarray:
+    """
+    Encodes a single query into a normalized embedding compatible with the FAISS index.
+    """
+    emb = model.encode([text], normalize_embeddings=True).astype("float32")
+    return emb
+
+def search_recipes(query: str, k: int) -> list[dict]:
+    """
+    Semantic search on the prebuilt FAISS index.
+    Returns list of dicts: {idx, title, score, nutrients_total}.
+    """
+    emb = encode_query(model, query)
+    D, I = index.search(emb, int(k))
+    out = []
+    for idx_i, score in zip(I[0], D[0]):
+        m = meta[int(idx_i)]
+        out.append({
+            "idx": int(idx_i),
+            "title": m.get("title"),
+            "score": float(score),
+            "nutrients_total": m.get("nutrients_total", {}) or {},
+        })
+    return out
+
+# -------- Nutrition calculators --------
+def tdee_msj(age: int, sex: str, height_cm: float, weight_kg: float, activity: str) -> float:
+    """
+    Mifflin–St Jeor TDEE with standard activity multipliers.
+    sex: 'male' or 'female'
+    activity in {'sedentary','light','moderate','active','athlete'}
+    """
+    s = 5 if (sex or "").lower() == "male" else -161
+    bmr = 10 * float(weight_kg) + 6.25 * float(height_cm) - 5 * int(age) + s
+    factors = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725, "athlete": 1.9}
+    return float(bmr) * factors.get(activity, 1.55)
+
+def macro_targets(calories: int, style: str) -> dict:
+    """
+    Macro split presets -> grams based on kcal.
+    - balanced:     P 25% / F 30% / C 45%
+    - high_protein: P 30% / F 25% / C 45%
+    - low_carb:     P 30% / F 40% / C 30%
+    """
+    if style == "high_protein":
+        pct = {"p": 0.30, "f": 0.25, "c": 0.45}
+    elif style == "low_carb":
+        pct = {"p": 0.30, "f": 0.40, "c": 0.30}
+    else:
+        pct = {"p": 0.25, "f": 0.30, "c": 0.45}
+    cal = int(calories)
+    return {
+        "calories": cal,
+        "protein_g": round(cal * pct["p"] / 4, 1),
+        "fat_g":     round(cal * pct["f"] / 9, 1),
+        "carb_g":    round(cal * pct["c"] / 4, 1),
+    }
+
+# -------- Helpers: numeric parsing & scoring --------
+def _num(x: Any) -> float:
+    """
+    Best-effort safe numeric conversion.
+    Accepts None/str/float/int; returns float (0.0 on failure).
+    """
+    try:
+        if x is None: return 0.0
+        if isinstance(x, (int, float)): return float(x)
+        s = str(x).strip()
+        if not s: return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _within(x: float, lo: float, hi: float) -> bool:
+    return (x >= lo) and (x <= hi)
+
+def _score_totals(totals: dict, targets: dict, weights: dict | None = None) -> float:
+    """
+    Weighted squared error to bias fit toward desired macros.
+    Lower is better. Defaults mildly favor protein accuracy.
+    """
+    w = weights or {"kcal": 1.0, "protein_g": 1.2, "fat_g": 0.8, "carb_g": 0.9}
+    return (
+        w["kcal"]      * (totals["kcal"]      - targets["calories"])**2 +
+        w["protein_g"] * (totals["protein_g"] - targets["protein_g"])**2 +
+        w["fat_g"]     * (totals["fat_g"]     - targets["fat_g"])**2 +
+        w["carb_g"]    * (totals["carb_g"]    - targets["carb_g"])**2
+    )
+
+# -------- Deterministic, constraint-safe 3-meal selector --------
+def strict_plan_from_hits(
+    hits: list[dict],
+    targets: dict,
+    *,
+    max_sodium_mg: float = 2300.0,
+    max_sugar_g: float = 50.0,
+    max_meal_kcal: int = 1000,
+    kcal_bounds_per_meal: tuple[float, float] = (200.0, 1200.0),
+    sodium_bounds_per_meal: tuple[float, float] = (0.0, 4000.0),
+    weights: dict | None = None,
+) -> dict | None:
+    """
+    Deterministically pick EXACTLY 3 meals from `hits` that:
+      • respect per-meal kcal and sodium bounds,
+      • keep daily sodium ≤ max_sodium_mg and sugar ≤ max_sugar_g,
+      • minimize macro error vs. `targets`.
+
+    Returns:
+      {
+        "meals": [ {title,kcal,protein_g,fat_g,carb_g,sugar_g,sodium_mg}, x3 ],
+        "totals": {...},
+        "score": float
+      }
+      or None if no feasible triple was found.
+    """
+    lo_kcal, hi_kcal = kcal_bounds_per_meal
+    lo_na, hi_na = sodium_bounds_per_meal
+
+    # Pre-filter pool for feasibility & quality
+    pool: list[dict] = []
+    for h in hits:
+        n = h.get("nutrients_total", {}) or {}
+        row = {
+            "title":       h.get("title"),
+            "kcal":        _num(n.get("kcal")),
+            "protein_g":   _num(n.get("protein_g")),
+            "fat_g":       _num(n.get("fat_g")),
+            "carb_g":      _num(n.get("carb_g")),
+            "sugar_g":     _num(n.get("sugar_g")),
+            "sodium_mg":   _num(n.get("sodium_mg")),
+            "retr_score":  _num(h.get("score")),  # retrieval similarity, FYI
+        }
+        # Hard per-meal sanity filters
+        if not _within(row["kcal"], lo_kcal, min(hi_kcal, float(max_meal_kcal))): 
+            continue
+        if not _within(row["sodium_mg"], lo_na, hi_na): 
+            continue
+        pool.append(row)
+
+    # Early exit if pool too small
+    if len(pool) < 3:
+        return None
+
+    # Efficient heuristic: try combinations from the top-N by retrieval + protein density
+    # This balances quality with speed for large k.
+    # You can tune N; 80–120 usually finds a good feasible set quickly.
+    N = min(120, len(pool))
+    def protein_density(r):  # g protein per 100 kcal (simple quality signal)
+        kcal = max(r["kcal"], 1.0)
+        return r["protein_g"] / (kcal / 100.0)
+    ranked = sorted(pool, key=lambda r: (protein_density(r), r["retr_score"]), reverse=True)[:N]
+
+    best = None
+    best_score = math.inf
+
+    # Try all triples from the ranked shortlist
+    for a_i in range(len(ranked)):
+        A = ranked[a_i]
+        for b_i in range(a_i + 1, len(ranked)):
+            B = ranked[b_i]
+            for c_i in range(b_i + 1, len(ranked)):
+                C = ranked[c_i]
+                totals = {
+                    "kcal":      A["kcal"]      + B["kcal"]      + C["kcal"],
+                    "protein_g": A["protein_g"] + B["protein_g"] + C["protein_g"],
+                    "fat_g":     A["fat_g"]     + B["fat_g"]     + C["fat_g"],
+                    "carb_g":    A["carb_g"]    + B["carb_g"]    + C["carb_g"],
+                    "sugar_g":   A["sugar_g"]   + B["sugar_g"]   + C["sugar_g"],
+                    "sodium_mg": A["sodium_mg"] + B["sodium_mg"] + C["sodium_mg"],
+                }
+                # Hard day caps
+                if totals["sodium_mg"] > max_sodium_mg: 
+                    continue
+                if totals["sugar_g"] > max_sugar_g: 
+                    continue
+
+                s = _score_totals(totals, targets, weights)
+                if s < best_score:
+                    best_score = s
+                    best = {
+                        "meals": [A, B, C],
+                        "totals": {k: round(v, 1) for k, v in totals.items()},
+                        "score": round(float(s), 2),
+                    }
+
+    return best
+
