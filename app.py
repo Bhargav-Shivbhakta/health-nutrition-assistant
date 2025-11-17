@@ -1089,3 +1089,90 @@ for role, msg in st.session_state.chat[-20:]:
 
 
 
+# =========================
+# Section 6: Polish & Support
+# =========================
+# - Lightweight CSS for a cleaner look
+# - Quick actions: Reset session, Re-run
+# - Help & FAQ with example prompts
+# - Troubleshooting panel (artifacts, env, sizes)
+# - Footer with version & disclaimers
+
+APP_VERSION = "1.0.0"
+
+# ----- Subtle CSS polish -----
+st.markdown(
+    """
+    <style>
+      /* tighten tables a bit */
+      .stDataFrame table { font-size: 0.92rem; }
+      /* nicer headers spacing */
+      h1, h2, h3 { margin-top: 0.6rem; }
+      /* hide deploy button if present (Cloud) */
+      [data-testid="stDecoration"] { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ----- Quick actions -----
+st.markdown("---")
+col_q1, col_q2, col_q3 = st.columns([1,1,3])
+with col_q1:
+    if st.button("🔁 Re-run", help="Force Streamlit to re-run the script"):
+        st.experimental_rerun()
+with col_q2:
+    if st.button("🧹 Reset session", help="Clear retrieved hits, plan, and chat"):
+        for k in ["last_hits", "last_plan", "chat"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.success("Session state cleared. You can retrieve and plan again.")
+
+# ----- Help & FAQ -----
+with st.expander("❓ Help & FAQ", expanded=False):
+    st.markdown("""
+**What can this app do?**
+- Retrieve recipes via semantic search (fast FAISS index).
+- Build a **strict 3-meal** day plan that matches macros and **honors sodium/sugar caps** and per-meal kcal.
+- Chat with an **agent** that can *retrieve → filter allergens → plan → swap → adjust targets → grocery list*.
+- Export the plan (CSV/JSON) and visualize distributions/fit.
+
+**Great prompts to try in Chat:**
+- “Build a **high-protein vegetarian** plan under **2,300 mg sodium** and **<50 g sugar**.”
+- “**Swap dinner** but **keep breakfast and lunch** the same.”
+- “Avoid **peanuts, shellfish** and re-plan.”
+- “Increase protein target by 15% and rebuild.”
+- “Create a **grocery list** for the current plan.”
+
+**Safety & scope**
+- This is **not medical advice**. It provides educational planning based on simplified nutrients per recipe.
+- The numeric **planner is deterministic** and enforces caps. The LLM cannot override constraints.
+    """)
+
+# ----- Troubleshooting panel -----
+with st.expander("🛠️ Troubleshooting & Diagnostics", expanded=False):
+    # Artifacts / config
+    st.markdown("**Artifacts**")
+    st.write("Config:", cfg.get("_resolved_cfg_path"))
+    st.write("FAISS :", f"{cfg.get('_resolved_faiss')} ({cfg.get('_faiss_size')})")
+    st.write("Meta  :", f"{cfg.get('_resolved_meta')} ({cfg.get('_meta_size')})")
+    st.write("Model :", cfg.get("_model_name"))
+
+    # Basic checks
+    checks = []
+    checks.append(("Meta length matches index.ntotal", len(meta) == index.ntotal))
+    checks.append(("OPENAI_API_KEY set (optional for chat)", bool(os.environ.get("OPENAI_API_KEY"))))
+
+    # Render checks
+    ok_issues, bad_issues = [], []
+    for label, ok in checks:
+        (ok_issues if ok else bad_issues).append(label)
+
+    if ok_issues:
+        st.success("✅ " + " · ".join(ok_issues))
+    if bad_issues:
+        st.warning("⚠️ " + " · ".join(bad_issues))
+
+    st.markdown("""
+**If the app fails to load:**
+1) Confirm these files exist in your repo:
