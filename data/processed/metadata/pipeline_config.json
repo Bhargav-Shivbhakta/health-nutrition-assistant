@@ -1,0 +1,5 @@
+{
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "faiss_index": "/content/drive/MyDrive/health-nutrition-assistant/data/metadata/faiss_index_small_ivfpq.faiss",
+  "meta_json": "/content/drive/MyDrive/health-nutrition-assistant/data/metadata/recipes_meta_small_slim.json"
+}
