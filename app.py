@@ -156,8 +156,6 @@ if "onboarded" not in st.session_state:
 
 if not st.session_state.onboarded:
     st.title("🥗 AI-Driven Health & Nutrition Assistant")
-    st.caption(DISCLAIMER)
-
     st.subheader("Tell me about you and your goal")
     st.write("You can either pick a preset **or** just write freely. I’ll interpret and build a plan.")
     pres = st.pills("Quick presets", GOAL_PRESETS, selection_mode="single") if hasattr(st, "pills") else st.selectbox("Quick presets", ["(none)"] + GOAL_PRESETS)
