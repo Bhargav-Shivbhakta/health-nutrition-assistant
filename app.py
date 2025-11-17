@@ -775,6 +775,8 @@ if st.session_state.page == "Home":
 # - Protein vs kcal scatter (quality view)
 # - Macro fit: plan vs targets
 # - Sodium & sugar vs caps
+if st.session_state.page != "Analysis":
+    st.stop()
 
 import altair as alt
 
@@ -932,6 +934,8 @@ else:
 # OPENAI_API_KEY is optional; if absent, the chat explains how to enable it.
 
 # ---------- Tool implementations ----------
+if st.session_state.page != "Chat":
+    st.stop()
 
 def tool_retrieve_recipes(query: str, k: int) -> dict:
     hits = search_recipes(query, k)
