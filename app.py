@@ -673,3 +673,419 @@ if plan:
 else:
     st.info("Build a plan to compare against your targets and caps.")
 
+# =========================
+# Section 5: Advanced Chatbot (Agent)
+# =========================
+# Tools the LLM can call:
+#   • retrieve_recipes      → FAISS search
+#   • filter_allergens      → drop hits by title keywords
+#   • build_strict_plan     → your deterministic planner
+#   • swap_meal             → keep 2 meals, replace 1
+#   • adjust_targets        → recompute targets from profile/goal/style
+#   • grocery_list          → rough list inferred from titles
+#
+# The agent loop allows up to 6 tool calls, then returns a final answer.
+# OPENAI_API_KEY is optional; if absent, the chat explains how to enable it.
+
+# ---------- Tool implementations ----------
+
+def tool_retrieve_recipes(query: str, k: int) -> dict:
+    hits = search_recipes(query, k)
+    return {"hits": hits[:k]}
+
+def tool_filter_allergens(hits: list[dict], blocked_terms: list[str]) -> dict:
+    if not blocked_terms:
+        return {"hits": hits}
+    blocked = {t.lower().strip() for t in blocked_terms if t}
+    out = []
+    for h in hits:
+        title = (h.get("title") or "").lower()
+        if any(b in title for b in blocked):
+            continue
+        out.append(h)
+    return {"hits": out}
+
+def tool_build_strict_plan(hits: list[dict], targets: dict, caps: dict, max_meal_kcal: int = 1000) -> dict:
+    plan = strict_plan_from_hits(
+        hits, targets,
+        max_sodium_mg=float(caps.get("max_sodium_mg", 2300)),
+        max_sugar_g=float(caps.get("max_sugar_g", 50)),
+        max_meal_kcal=int(max_meal_kcal),
+    )
+    return {"plan": plan}
+
+def tool_swap_meal(current_plan: dict, keep_slots: list[int], hits: list[dict], targets: dict, caps: dict, max_meal_kcal: int = 1000) -> dict:
+    """
+    keep_slots are 1-based indices to keep (e.g., [1,2] keep first two meals).
+    We brute-force the replacement for the remaining slot, re-checking constraints.
+    """
+    import math
+    if not current_plan or not current_plan.get("meals"):
+        return {"plan": None}
+    meals = current_plan["meals"]
+    if len(meals) != 3:
+        return {"plan": None}
+
+    keep = set(keep_slots or [])
+    # Build candidate pool with the same filters the planner uses
+    pool = []
+    for h in hits:
+        n = h.get("nutrients_total", {}) or {}
+        row = {
+            "title": h.get("title"),
+            "kcal": _num(n.get("kcal")), "protein_g": _num(n.get("protein_g")),
+            "fat_g": _num(n.get("fat_g")), "carb_g": _num(n.get("carb_g")),
+            "sugar_g": _num(n.get("sugar_g")), "sodium_mg": _num(n.get("sodium_mg")),
+        }
+        if row["kcal"] <= 0 or row["kcal"] > 2000: continue
+        if row["sodium_mg"] < 0 or row["sodium_mg"] > 4000: continue
+        if row["kcal"] > max_meal_kcal: continue
+        pool.append(row)
+
+    def score_set(totals, targets, w=None):
+        w = w or {"kcal":1.0,"protein_g":1.2,"fat_g":0.8,"carb_g":0.9}
+        return (w["kcal"]*(totals["kcal"]-targets["calories"])**2 +
+                w["protein_g"]*(totals["protein_g"]-targets["protein_g"])**2 +
+                w["fat_g"]*(totals["fat_g"]-targets["fat_g"])**2 +
+                w["carb_g"]*(totals["carb_g"]-targets["carb_g"])**2)
+
+    # Identify which slot is replaceable
+    replace_idx = None
+    for i in (1,2,3):
+        if i not in keep:
+            replace_idx = i
+            break
+    if replace_idx is None:
+        return {"plan": current_plan}
+
+    best = None
+    best_score = math.inf
+    for cand in pool:
+        combo = []
+        for i in (1,2,3):
+            combo.append(meals[i-1] if i in keep else cand)
+        totals = {
+            "kcal": sum(m["kcal"] for m in combo),
+            "protein_g": sum(m["protein_g"] for m in combo),
+            "fat_g": sum(m["fat_g"] for m in combo),
+            "carb_g": sum(m["carb_g"] for m in combo),
+            "sugar_g": sum(m["sugar_g"] for m in combo),
+            "sodium_mg": sum(m["sodium_mg"] for m in combo),
+        }
+        if totals["sodium_mg"] > float(caps.get("max_sodium_mg", 2300)): 
+            continue
+        if totals["sugar_g"] > float(caps.get("max_sugar_g", 50)):
+            continue
+        s = score_set(totals, targets)
+        if s < best_score:
+            best_score = s
+            best = {"meals": combo, "totals": {k: round(v,1) for k,v in totals.items()}, "score": round(s,2)}
+    return {"plan": best or current_plan}
+
+def tool_adjust_targets(profile: dict, macro_style: str, goal: str) -> dict:
+    cal = round(tdee_msj(profile["age"], profile["sex"], profile["height_cm"], profile["weight_kg"], profile["activity"]))
+    if goal == "loss": cal = round(cal * 0.85)
+    if goal == "gain": cal = round(cal * 1.10)
+    return {"targets": macro_targets(cal, macro_style)}
+
+def tool_grocery_list(plan: dict) -> dict:
+    # We don't have ingredients, so infer a rough list from titles.
+    import re
+    if not plan or not plan.get("meals"): 
+        return {"items": []}
+    bag = {}
+    for m in plan["meals"]:
+        for tok in re.findall(r"[A-Za-z]+", (m["title"] or "").lower()):
+            if len(tok) < 3: 
+                continue
+            bag[tok] = bag.get(tok, 0) + 1
+    items = [w for w,c in sorted(bag.items(), key=lambda x: (-x[1], x[0]))[:20]]
+    return {"items": items}
+
+# ---------- Tool specs (OpenAI function calling) ----------
+
+def build_tool_specs() -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "retrieve_recipes",
+                "description": "Semantic recipe retrieval by intent/tags.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "k": {"type": "integer", "minimum": 5, "maximum": 150}
+                    },
+                    "required": ["query","k"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "filter_allergens",
+                "description": "Filter out hits containing any blocked keywords in their titles.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "hits": {"type":"array"},
+                        "blocked_terms": {"type":"array","items":{"type":"string"}}
+                    },
+                    "required": ["hits","blocked_terms"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "build_strict_plan",
+                "description": "Pick EXACTLY 3 meals within sodium/sugar caps and near macro targets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "hits": {"type":"array"},
+                        "targets": {"type":"object"},
+                        "caps": {"type":"object"},
+                        "max_meal_kcal": {"type":"integer"}
+                    },
+                    "required": ["hits","targets","caps"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "swap_meal",
+                "description": "Swap one meal but keep the other two fixed; re-balance to targets under caps.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "current_plan": {"type":"object"},
+                        "keep_slots": {"type":"array","items":{"type":"integer"}},
+                        "hits": {"type":"array"},
+                        "targets": {"type":"object"},
+                        "caps": {"type":"object"},
+                        "max_meal_kcal": {"type":"integer"}
+                    },
+                    "required": ["current_plan","keep_slots","hits","targets","caps"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "adjust_targets",
+                "description": "Recompute macro targets from profile, macro style, and goal.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "profile": {"type":"object"},
+                        "macro_style": {"type":"string"},
+                        "goal": {"type":"string"}
+                    },
+                    "required": ["profile","macro_style","goal"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grocery_list",
+                "description": "Create a rough grocery list from the chosen meals.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan": {"type":"object"}
+                    },
+                    "required": ["plan"]
+                }
+            }
+        }
+    ]
+
+# ---------- Agent loop ----------
+
+def _openai_client():
+    try:
+        from openai import OpenAI  # type: ignore
+        return OpenAI()
+    except Exception:
+        return None
+
+def run_agent(user_msg: str, context: dict) -> str:
+    """
+    context contains:
+      - profile, targets, caps, settings (k, intent, max_meal_kcal, blocked_terms)
+      - last_hits, last_plan
+    Updates st.session_state when tools return new hits/plan.
+    """
+    client = _openai_client()
+    if not client or not os.environ.get("OPENAI_API_KEY"):
+        return "LLM not configured. Set OPENAI_API_KEY to enable the advanced chat."
+
+    sys = (
+        "You are an advanced nutrition planning assistant. "
+        "Use the tools to retrieve recipes, build a 3-meal plan within constraints, "
+        "swap meals, adjust targets, and create a grocery list. "
+        "NEVER invent nutrients. ALWAYS respect sodium/sugar/day and max kcal per meal. "
+        "Be concise and actionable."
+    )
+
+    messages = [
+        {"role":"system","content":sys},
+        {"role":"user","content":json.dumps({
+            "message": user_msg,
+            "profile": context["profile"],
+            "targets": context["targets"],
+            "caps": context["caps"],
+            "settings": context["settings"],
+            "has_last_hits": bool(context.get("last_hits")),
+            "has_last_plan": bool(context.get("last_plan")),
+        })}
+    ]
+
+    tools = build_tool_specs()
+    scratch: dict = {}
+
+    for _ in range(6):  # up to 6 tool calls
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        msg = resp.choices[0].message
+        if msg.tool_calls:
+            for call in msg.tool_calls:
+                name = call.function.name
+                args = json.loads(call.function.arguments or "{}")
+
+                # Provide defaults from context/scratch
+                if name in ("build_strict_plan", "swap_meal"):
+                    args.setdefault("targets", scratch.get("targets") or context["targets"])
+                    args.setdefault("caps", context["caps"])
+                    args.setdefault("max_meal_kcal", context["settings"]["max_meal_kcal"])
+                if name in ("filter_allergens","build_strict_plan","swap_meal"):
+                    args.setdefault("hits", scratch.get("hits") or context.get("last_hits") or [])
+                if name == "swap_meal":
+                    args.setdefault("current_plan", scratch.get("plan") or context.get("last_plan") or {})
+                    args.setdefault("keep_slots", [1,2])
+                if name == "retrieve_recipes":
+                    args.setdefault("query", context["settings"]["intent"])
+                    args.setdefault("k", context["settings"]["k"])
+                if name == "adjust_targets":
+                    args.setdefault("profile", context["profile"])
+                    args.setdefault("macro_style", context["profile"]["macro_style"])
+                    args.setdefault("goal", context["profile"]["goal"])
+                if name == "grocery_list":
+                    args.setdefault("plan", scratch.get("plan") or context.get("last_plan") or {})
+
+                # Dispatch tool
+                if name == "retrieve_recipes":
+                    out = tool_retrieve_recipes(args["query"], int(args["k"]))
+                    scratch["hits"] = out["hits"]
+                    st.session_state.last_hits = out["hits"]
+                elif name == "filter_allergens":
+                    out = tool_filter_allergens(args["hits"], args.get("blocked_terms", []))
+                    scratch["hits"] = out["hits"]
+                    st.session_state.last_hits = out["hits"]
+                elif name == "build_strict_plan":
+                    out = tool_build_strict_plan(args["hits"], args["targets"], args["caps"], args.get("max_meal_kcal", 1000))
+                    scratch["plan"] = out["plan"]
+                    st.session_state.last_plan = out["plan"]
+                elif name == "swap_meal":
+                    out = tool_swap_meal(args["current_plan"], args.get("keep_slots", [1,2]), args["hits"], args["targets"], args["caps"], args.get("max_meal_kcal", 1000))
+                    scratch["plan"] = out["plan"]
+                    st.session_state.last_plan = out["plan"]
+                elif name == "adjust_targets":
+                    out = tool_adjust_targets(args["profile"], args["macro_style"], args["goal"])
+                    scratch["targets"] = out["targets"]
+                elif name == "grocery_list":
+                    out = tool_grocery_list(args["plan"])
+                    scratch["grocery"] = out["items"]
+                else:
+                    out = {"error": f"Unknown tool {name}"}
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": name,
+                    "content": json.dumps(out)
+                })
+            continue
+
+        # No tool calls → final natural language answer
+        return msg.content or json.dumps(scratch)
+
+    return "I reached the tool-call limit. Try adjusting constraints or asking again."
+
+# ---------- Chat UI (Agent) ----------
+
+st.markdown("---")
+st.header("💬 Advanced Chat (Agent)")
+
+if "chat" not in st.session_state:
+    st.session_state.chat: list[tuple[str,str]] = []
+
+# Controls to guide the agent
+colA, colB, colC = st.columns(3)
+with colA:
+    blocked_terms = st.text_input("Allergen/avoid keywords (comma-separated)", value="")
+with colB:
+    intent_override = st.text_input("Intent override (optional)", value="")
+with colC:
+    keep_slots_str = st.text_input("Swap keep slots (e.g., '1,2' to keep first two)", value="1,2")
+
+# Build context dict for the agent
+profile_ctx = st.session_state.profile
+targets_ctx = current_targets
+caps_ctx = st.session_state.caps
+settings_ctx = {
+    "k": st.session_state.search["k"],
+    "intent": (intent_override.strip() or st.session_state.search["intent"]),
+    "max_meal_kcal": st.session_state.caps["max_meal_kcal"],
+    "blocked_terms": [t.strip() for t in blocked_terms.split(",") if t.strip()],
+}
+
+user_msg = st.text_input("You:", placeholder="e.g., Build a high-protein vegetarian plan under 2300 mg sodium and avoid peanuts.")
+send = st.button("Send", use_container_width=False)
+
+if send and user_msg.strip():
+    # Keep a running log
+    st.session_state.chat.append(("user", user_msg.strip()))
+
+    if os.environ.get("OPENAI_API_KEY"):
+        # Seed context with latest state
+        ctx = {
+            "profile": profile_ctx,
+            "targets": targets_ctx,
+            "caps": caps_ctx,
+            "settings": settings_ctx,
+            "last_hits": st.session_state.last_hits,
+            "last_plan": st.session_state.last_plan,
+        }
+        # If the message looks like a swap request, expose keep slots
+        try:
+            keep_list = [int(x) for x in keep_slots_str.split(",") if x.strip().isdigit()]
+            if keep_list:
+                ctx["settings"]["keep_slots"] = keep_list
+        except Exception:
+            pass
+
+        reply = run_agent(user_msg.strip(), ctx)
+    else:
+        reply = "LLM not configured. Set OPENAI_API_KEY in your environment to enable the advanced chat."
+
+    st.session_state.chat.append(("assistant", reply))
+
+# Render the chat (last 20 turns)
+for role, msg in st.session_state.chat[-20:]:
+    if role == "user":
+        st.markdown(f"**You:** {msg}")
+    else:
+        st.markdown(f"**Assistant:** {msg}")
+
+
+
