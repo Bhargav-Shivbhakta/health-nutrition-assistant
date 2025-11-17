@@ -59,8 +59,8 @@ def find_config_path() -> Path:
     candidates: List[str | Path | None] = [
         env_p,
         "data/processed/metadata/pipeline_config.json",  # <— recommended
-        "data/metadata/pipeline_config.json",
-        "data/processed/pipeline_config.json",
+        "data/processed/metadata/pipeline_config.json",
+        "data/processed/metadata/pipeline_config.json",
         "pipeline_config.json",
     ]
     cfgp = _first_existing(candidates)
