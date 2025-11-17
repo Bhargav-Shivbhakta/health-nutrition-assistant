@@ -1090,13 +1090,8 @@ for role, msg in st.session_state.chat[-20:]:
 
 
 # =========================
-# Section 6: Polish & Support
+# Section 6: Polish & Support  (fixed)
 # =========================
-# - Lightweight CSS for a cleaner look
-# - Quick actions: Reset session, Re-run
-# - Help & FAQ with example prompts
-# - Troubleshooting panel (artifacts, env, sizes)
-# - Footer with version & disclaimers
 
 APP_VERSION = "1.0.0"
 
@@ -1104,11 +1099,8 @@ APP_VERSION = "1.0.0"
 st.markdown(
     """
     <style>
-      /* tighten tables a bit */
       .stDataFrame table { font-size: 0.92rem; }
-      /* nicer headers spacing */
       h1, h2, h3 { margin-top: 0.6rem; }
-      /* hide deploy button if present (Cloud) */
       [data-testid="stDecoration"] { display: none !important; }
     </style>
     """,
@@ -1119,60 +1111,59 @@ st.markdown(
 st.markdown("---")
 col_q1, col_q2, col_q3 = st.columns([1,1,3])
 with col_q1:
-    if st.button("🔁 Re-run", help="Force Streamlit to re-run the script"):
+    if st.button("🔁 Re-run"):
         st.experimental_rerun()
 with col_q2:
-    if st.button("🧹 Reset session", help="Clear retrieved hits, plan, and chat"):
+    if st.button("🧹 Reset session"):
         for k in ["last_hits", "last_plan", "chat"]:
             if k in st.session_state:
                 del st.session_state[k]
-        st.success("Session state cleared. You can retrieve and plan again.")
+        st.success("Session cleared. Ready for a new run!")
 
 # ----- Help & FAQ -----
 with st.expander("❓ Help & FAQ", expanded=False):
-    st.markdown("""
+    st.markdown(
+        """
 **What can this app do?**
-- Retrieve recipes via semantic search (fast FAISS index).
-- Build a **strict 3-meal** day plan that matches macros and **honors sodium/sugar caps** and per-meal kcal.
-- Chat with an **agent** that can *retrieve → filter allergens → plan → swap → adjust targets → grocery list*.
-- Export the plan (CSV/JSON) and visualize distributions/fit.
+- Retrieve recipes with semantic search.
+- Build a **strict 3-meal plan** honoring sodium/sugar/day and kcal/meal caps.
+- Chat with an **agent** that can *retrieve → filter allergens → plan → swap → adjust → grocery list*.
+- Export plans (CSV/JSON) and visualize them.
 
-**Great prompts to try in Chat:**
-- “Build a **high-protein vegetarian** plan under **2,300 mg sodium** and **<50 g sugar**.”
-- “**Swap dinner** but **keep breakfast and lunch** the same.”
-- “Avoid **peanuts, shellfish** and re-plan.”
-- “Increase protein target by 15% and rebuild.”
-- “Create a **grocery list** for the current plan.”
+**Try prompts such as:**
+- “Build a **high-protein vegetarian** plan under **2 300 mg sodium**.”
+- “Swap dinner but keep breakfast and lunch.”
+- “Avoid **peanuts and shellfish**.”
+- “Increase protein target by 15 % and rebuild.”
+- “Create a **grocery list** for my current plan.”
 
-**Safety & scope**
-- This is **not medical advice**. It provides educational planning based on simplified nutrients per recipe.
-- The numeric **planner is deterministic** and enforces caps. The LLM cannot override constraints.
-    """)
+**Safety**
+> This tool is educational. It does **not** give medical advice.
+"""
+    )
 
 # ----- Troubleshooting panel -----
 with st.expander("🛠️ Troubleshooting & Diagnostics", expanded=False):
-    # Artifacts / config
     st.markdown("**Artifacts**")
     st.write("Config:", cfg.get("_resolved_cfg_path"))
     st.write("FAISS :", f"{cfg.get('_resolved_faiss')} ({cfg.get('_faiss_size')})")
     st.write("Meta  :", f"{cfg.get('_resolved_meta')} ({cfg.get('_meta_size')})")
     st.write("Model :", cfg.get("_model_name"))
 
-    # Basic checks
-    checks = []
-    checks.append(("Meta length matches index.ntotal", len(meta) == index.ntotal))
-    checks.append(("OPENAI_API_KEY set (optional for chat)", bool(os.environ.get("OPENAI_API_KEY"))))
+    checks = [
+        ("Meta length matches index.ntotal", len(meta) == index.ntotal),
+        ("OPENAI_API_KEY set", bool(os.environ.get("OPENAI_API_KEY"))),
+    ]
 
-    # Render checks
-    ok_issues, bad_issues = [], []
-    for label, ok in checks:
-        (ok_issues if ok else bad_issues).append(label)
+    good = [c[0] for c in checks if c[1]]
+    bad  = [c[0] for c in checks if not c[1]]
 
-    if ok_issues:
-        st.success("✅ " + " · ".join(ok_issues))
-    if bad_issues:
-        st.warning("⚠️ " + " · ".join(bad_issues))
+    if good:
+        st.success("✅ " + " · ".join(good))
+    if bad:
+        st.warning("⚠️ " + " · ".join(bad))
 
-    st.markdown("""
-**If the app fails to load:**
-1) Confirm these files exist in your repo:
+    st.markdown(
+        """
+**If startup fails**
+1. Verify these exist:
