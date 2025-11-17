@@ -56,12 +56,12 @@ def find_config_path() -> Path:
     This makes the app tolerant to small repo layout differences.
     """
     env_p = os.environ.get("PIPELINE_CONFIG")
-    candidates: List[str | Path | None] = [
-        env_p,
-        "data/processed/metadata/pipeline_config.json",  # <— recommended
-        "data/processed/metadata/pipeline_config.json",
-        "data/processed/metadata/pipeline_config.json",
-        "pipeline_config.json",
+    candidates: list[str | Path | None] = [
+    env_p,                                           # if set via env var
+    "data/processed/metadata/pipeline_config.json",  # ✅ your real path
+    "data/metadata/pipeline_config.json",            # fallback (old structure)
+    "data/processed/pipeline_config.json",           # fallback
+    "pipeline_config.json",                          # last resort
     ]
     cfgp = _first_existing(candidates)
     if not cfgp:
