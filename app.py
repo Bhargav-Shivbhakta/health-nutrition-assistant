@@ -1,202 +1,161 @@
-import os, json, math, itertools, faiss, numpy as np, streamlit as st
+# =========================
+# Section 1: Bootstrapping
+# =========================
+# - Imports & Streamlit page config
+# - Robust discovery of pipeline_config.json
+# - Cached pipeline loader (model by name + FAISS + slim meta)
+# - Hard validation of artifacts so failures are obvious
+
+from __future__ import annotations
+
+import os
+import json
+import math
+import itertools
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
-st.set_page_config(page_title="AI-Driven Health & Nutrition Assistant", page_icon="🥗", layout="wide")
+import streamlit as st
+import numpy as np
+import pandas as pd
+import faiss
+from sentence_transformers import SentenceTransformer
 
-DATA_PROC = Path("data/processed")
-CONFIG_PATH = DATA_PROC / "pipeline_config.json"
+# ---- Streamlit page config (set this before anything renders)
+st.set_page_config(
+    page_title="🥗 AI Health & Nutrition Assistant",
+    page_icon="🥗",
+    layout="wide",
+)
 
-@st.cache_resource(show_spinner=False)
-def load_pipeline():
-    cfg = json.loads(Path(CONFIG_PATH).read_text(encoding="utf-8"))
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(cfg["model_dir"])
-    index = faiss.read_index(cfg["faiss_index"])
-    meta  = json.loads(Path(cfg["meta_json"]).read_text(encoding="utf-8"))
+# ---- Constants
+DISCLAIMER = (
+    "This tool is for educational purposes only and does **not** provide medical advice. "
+    "Consult a qualified professional for personalized guidance."
+)
+
+# ---- Small utility
+def _first_existing(paths: List[str | Path | None]) -> Path | None:
+    for p in paths:
+        if p and Path(p).is_file():
+            return Path(p)
+    return None
+
+def _human_mb(path: Path) -> str:
+    try:
+        return f"{os.path.getsize(path) / (1024*1024):.1f} MB"
+    except Exception:
+        return "?"
+
+# -----------------------------------------
+# Robust config discovery & artifact resolve
+# -----------------------------------------
+def find_config_path() -> Path:
+    """
+    Returns the path to pipeline_config.json by checking common locations and an env override.
+    This makes the app tolerant to small repo layout differences.
+    """
+    env_p = os.environ.get("PIPELINE_CONFIG")
+    candidates: List[str | Path | None] = [
+        env_p,
+        "data/processed/metadata/pipeline_config.json",  # <— recommended
+        "data/metadata/pipeline_config.json",
+        "data/processed/pipeline_config.json",
+        "pipeline_config.json",
+    ]
+    cfgp = _first_existing(candidates)
+    if not cfgp:
+        st.error(
+            "Could not find `pipeline_config.json`.\n\n"
+            "I looked in:\n- " + "\n- ".join(str(c) for c in candidates) +
+            "\n\nFix by placing the config at `data/processed/metadata/pipeline_config.json` "
+            "or set an env var `PIPELINE_CONFIG` to the exact file path."
+        )
+        # Show top-level tree to help debug quickly
+        try:
+            st.write("Top-level files:", [str(p) for p in Path('.').iterdir()])
+        except Exception:
+            pass
+        st.stop()
+    return cfgp
+
+def _resolve_relative_to(base: Path, maybe_path: str) -> Path:
+    """
+    If `maybe_path` is relative, interpret it relative to `base` (the folder of the config).
+    """
+    p = Path(maybe_path)
+    return p if p.is_absolute() else (base / p)
+
+# -----------------------------------------
+# Cached pipeline: model (by name), FAISS, meta
+# -----------------------------------------
+@st.cache_resource(show_spinner=True)
+def load_pipeline() -> Tuple[SentenceTransformer, faiss.Index, List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Loads:
+      - SentenceTransformer by *name* (auto-download to HF cache, keeps repo small)
+      - FAISS IVF-PQ index (or any FAISS index path pointed by config)
+      - Slim metadata (titles + nutrients), aligned 1:1 with index rows
+
+    Returns:
+      (model, index, meta, cfg) where cfg also includes resolved file paths for debugging.
+    """
+    cfg_path = find_config_path()
+    cfg_raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+
+    # Model by name keeps your repo tiny and reproducible
+    model_name = cfg_raw.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
+
+    # Resolve artifact paths relative to the config file’s parent
+    base = cfg_path.parent
+    faiss_path = _resolve_relative_to(base, cfg_raw["faiss_index"])
+    meta_path  = _resolve_relative_to(base, cfg_raw["meta_json"])
+
+    # Validate artifacts exist
+    missing = [p for p in [faiss_path, meta_path] if not p.is_file()]
+    if missing:
+        st.error(
+            "Required artifact(s) not found:\n- " + "\n- ".join(str(m) for m in missing) +
+            "\n\nEnsure these files exist in your repo (e.g., under `data/processed/metadata/`)."
+        )
+        # Show neighbors to quickly diagnose misplaced files
+        try:
+            st.write("Nearby files:", [str(p) for p in base.iterdir()])
+        except Exception:
+            pass
+        st.stop()
+
+    # Load assets
+    model = SentenceTransformer(model_name)
+    index = faiss.read_index(str(faiss_path))
+    meta  = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    # Strong sanity check: meta size must match index rows
+    if len(meta) != index.ntotal:
+        st.error(
+            f"Meta rows ({len(meta)}) != index.ntotal ({index.ntotal}).\n"
+            "Make sure your meta is the slimmed file aligned to the same vectors as the FAISS index."
+        )
+        st.stop()
+
+    # Enrich cfg for debugging and UI visibility
+    cfg = {
+        **cfg_raw,
+        "_resolved_cfg_path": str(cfg_path),
+        "_resolved_faiss": str(faiss_path),
+        "_resolved_meta": str(meta_path),
+        "_faiss_size": _human_mb(faiss_path),
+        "_meta_size": _human_mb(meta_path),
+        "_model_name": model_name,
+    }
     return model, index, meta, cfg
 
-def search_recipes(query, k, model, index, meta):
-    from sentence_transformers import SentenceTransformer
-    emb = model.encode([query], normalize_embeddings=True).astype("float32")
-    D, I = index.search(emb, k)
-    out = []
-    for idx, score in zip(I[0], D[0]):
-        m = meta[int(idx)]
-        out.append({
-            "idx": int(idx),
-            "title": m.get("title"),
-            "score": float(score),
-            "nutrients_total": m.get("nutrients_total", {})
-        })
-    return out
-
-def macro_targets(calories, style):
-    if style == "high_protein": pct={"p":0.30,"f":0.25,"c":0.45}
-    elif style == "low_carb":   pct={"p":0.30,"f":0.40,"c":0.30}
-    else:                       pct={"p":0.25,"f":0.30,"c":0.45}
-    return {
-        "calories": int(calories),
-        "protein_g": round(calories*pct["p"]/4,1),
-        "fat_g":     round(calories*pct["f"]/9,1),
-        "carb_g":    round(calories*pct["c"]/4,1),
-    }
-
-def _num(x):
-    try: return float(x or 0.0)
-    except: return 0.0
-
-def _score_set(totals, targets, w=None):
-    w = w or {"kcal":1.0, "protein_g":1.2, "fat_g":0.8, "carb_g":0.9}
-    return (
-        w["kcal"]      * (totals["kcal"]      - targets["calories"])**2 +
-        w["protein_g"] * (totals["protein_g"] - targets["protein_g"])**2 +
-        w["fat_g"]     * (totals["fat_g"]     - targets["fat_g"])**2 +
-        w["carb_g"]    * (totals["carb_g"]    - targets["carb_g"])**2
-    )
-
-def strict_plan_from_hits(hits, targets, max_sodium_mg=2300, max_sugar_g=50, max_meal_kcal=1000):
-    pool=[]
-    for h in hits:
-        n = h.get("nutrients_total",{}) or {}
-        row = {
-            "title": h["title"],
-            "kcal": _num(n.get("kcal")), "protein_g": _num(n.get("protein_g")),
-            "fat_g": _num(n.get("fat_g")), "carb_g": _num(n.get("carb_g")),
-            "sugar_g": _num(n.get("sugar_g")), "sodium_mg": _num(n.get("sodium_mg")),
-            "score": float(h.get("score",0))
-        }
-        if row["kcal"] <= 0 or row["kcal"] > 2000: continue
-        if row["sodium_mg"] < 0 or row["sodium_mg"] > 4000: continue
-        if row["kcal"] > max_meal_kcal: continue
-        pool.append(row)
-
-    best=None; best_score=math.inf
-    for a,b,c in itertools.combinations(pool, 3):
-        totals = {
-            "kcal": a["kcal"]+b["kcal"]+c["kcal"],
-            "protein_g": a["protein_g"]+b["protein_g"]+c["protein_g"],
-            "fat_g": a["fat_g"]+b["fat_g"]+c["fat_g"],
-            "carb_g": a["carb_g"]+b["carb_g"]+c["carb_g"],
-            "sugar_g": a["sugar_g"]+b["sugar_g"]+c["sugar_g"],
-            "sodium_mg": a["sodium_mg"]+b["sodium_mg"]+c["sodium_mg"],
-        }
-        if totals["sodium_mg"] > max_sodium_mg: continue
-        if totals["sugar_g"]  > max_sugar_g:  continue
-        s = _score_set(totals, targets)
-        if s < best_score:
-            best_score = s
-            best = {"meals": [a,b,c], "totals": {k: round(v,1) for k,v in totals.items()}, "score": round(s,2)}
-    return best
-
-def llm_available():
-    try:
-        from openai import OpenAI
-        _ = os.environ.get("OPENAI_API_KEY")
-        return _ is not None and len(_) > 0
-    except Exception:
-        return False
-
-def llm_explain_plan(plan_dict, model_name="gpt-4o-mini"):
-    from openai import OpenAI
-    client = OpenAI()
-    system = "You are a nutrition coach. Explain in 3-5 bullet points why this 3-meal plan fits the user's targets and constraints. Be specific about macros and sodium. Keep it concise."
-    messages = [
-        {"role":"system","content":system},
-        {"role":"user","content":json.dumps(plan_dict)}
-    ]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.2)
-    return resp.choices[0].message.content.strip()
-
+# ---- Bootstrap the pipeline early so later sections can rely on it
 model, index, meta, cfg = load_pipeline()
-st.success(f"Loaded model & index • recipes: {len(meta):,}")
 
-with st.sidebar:
-    st.header("User & Constraints")
-    query = st.text_input("Search intent", value="balanced vegetarian high-protein")
-    k      = st.slider("Candidates (k)", 10, 100, 60, 10)
-    calories = st.number_input("Calories target", 1200, 5000, 2200, 50)
-    macro   = st.selectbox("Macro style", ["balanced","high_protein","low_carb"])
-    max_sodium = st.number_input("Max sodium (mg)", 0, 6000, 2300, 50)
-    max_sugar  = st.number_input("Max sugar (g)", 0, 200, 50, 1)
-    max_meal_kcal = st.number_input("Max calories per meal", 400, 2000, 1000, 50)
-    want_llm = st.checkbox("Use LLM to explain the final plan (requires OPENAI_API_KEY)", value=True)
-    run = st.button("Generate Plan")
-
-tabs = st.tabs(["🔎 Search", "🗓️ Planner", "💬 Chat"])
-
-if run:
-    hits = search_recipes(query, k, model, index, meta)
-
-    with tabs[0]:
-        st.subheader("Top results (first 10)")
-        for i, h in enumerate(hits[:10], 1):
-            n = h["nutrients_total"]
-            st.write(f"{i}. **{h['title']}**  | score `{h['score']:.3f}` | kcal `{n.get('kcal')}` | protein `{n.get('protein_g')}` g")
-
-    with tabs[1]:
-        st.subheader("Planner")
-        tgt = macro_targets(int(calories), macro)
-        st.markdown("**🎯 Targets**")
-        st.json(tgt)
-
-        best = strict_plan_from_hits(hits, tgt, max_sodium_mg=max_sodium, max_sugar_g=max_sugar, max_meal_kcal=max_meal_kcal)
-        if best:
-            st.markdown("**🏆 Strict 3-meal plan (constraint-safe)**")
-            for i, m in enumerate(best["meals"], 1):
-                st.markdown(f"**{i}. {m['title']}** — kcal `{m['kcal']}` | protein `{m['protein_g']}`g | fat `{m['fat_g']}`g | carb `{m['carb_g']}`g | Na `{m['sodium_mg']}`mg")
-            st.markdown(f"**Day totals:** {best['totals']}")
-
-            if want_llm and llm_available():
-                st.markdown("---")
-                st.subheader("🤖 LLM Rationale")
-                plan_payload = {
-                    "query": query,
-                    "targets": tgt,
-                    "meals": best["meals"],
-                    "day_totals": best["totals"],
-                    "rules": {"max_sodium_mg": int(max_sodium), "max_sugar_g": int(max_sugar)}
-                }
-                try:
-                    rationale = llm_explain_plan(plan_payload)
-                    st.write(rationale)
-                except Exception as e:
-                    st.warning(f"LLM explanation failed: {e}")
-            elif want_llm:
-                st.info("Set the OPENAI_API_KEY environment variable to enable LLM explanations.")
-        else:
-            st.warning("No 3-meal combo satisfied your caps. Try increasing k or relaxing caps.")
-
-    with tabs[2]:
-        st.subheader("Chat (LLM)")
-        st.caption("Ask: *Why sodium cap?*, *Swap dinner under 700 kcal*, etc.")
-        if "chat" not in st.session_state: st.session_state.chat = []
-        user_msg = st.text_input("You:", key="chat_input")
-        if st.button("Send", key="send_btn"):
-            if user_msg.strip():
-                st.session_state.chat.append(("user", user_msg.strip()))
-                if llm_available():
-                    try:
-                        from openai import OpenAI
-                        client = OpenAI()
-                        context = {"last_query": query, "targets": macro_targets(int(calories), macro)}
-                        sys = "You are a helpful nutrition assistant. Keep answers concise and grounded."
-                        messages = [{"role":"system","content":sys},
-                                    {"role":"user","content":json.dumps(context)},
-                                    {"role":"user","content":user_msg.strip()}]
-                        r = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.3)
-                        st.session_state.chat.append(("assistant", r.choices[0].message.content.strip()))
-                    except Exception as e:
-                        st.session_state.chat.append(("assistant", f"(LLM error: {e})"))
-                else:
-                    st.session_state.chat.append(("assistant", "LLM not configured. Set OPENAI_API_KEY."))
-
-        for role, msg in st.session_state.chat[-12:]:
-            if role == "user": st.markdown(f"**You:** {msg}")
-            else: st.markdown(f"**Assistant:** {msg}")
-else:
-    with tabs[0]:
-        st.info("Enter your search intent on the left and click **Generate Plan**.")
-    with tabs[1]:
-        st.info("Planner will appear here after you click **Generate Plan**.")
-    with tabs[2]:
-        st.info("Enable OPENAI_API_KEY to use chat.")
+# Optional: a tiny expander to confirm what the app is actually using
+with st.expander("Artifacts (resolved)", expanded=False):
+    st.write("Config:", cfg.get("_resolved_cfg_path"))
+    st.write("FAISS :", f"{cfg.get('_resolved_faiss')} ({cfg.get('_faiss_size')})")
+    st.write("Meta  :", f"{cfg.get('_resolved_meta')} ({cfg.get('_meta_size')})")
+    st.write("Model :", cfg.get("_model_name"))
