@@ -56,22 +56,6 @@ except NameError:
             "fat_g":     round(cal * pct["f"] / 9, 1),
             "carb_g":    round(cal * pct["c"] / 4, 1),
         }
-
-
-GOAL_PRESETS = [
-    "Weight loss, high-protein, low sodium",
-    "Muscle gain, high-protein, moderate carbs",
-    "Balanced diet for maintenance",
-    "Low-carb for blood sugar control",
-    "Heart-healthy (low sodium)",
-    "High-fiber vegetarian",
-    "Pescatarian high-protein",
-    "Dairy-free, high-protein",
-    "Gluten-free balanced",
-    "Plant-based endurance (higher carbs)",
-]
-
-
 def _coerce_sex(s: str) -> str:
     s = (s or "").lower()
     if "f" in s and "male" not in s: return "female"
@@ -181,12 +165,6 @@ if "onboarded" not in st.session_state:
 if not st.session_state.onboarded:
     st.title("🥗 AI-Driven Health & Nutrition Assistant")
     st.subheader("Tell me about you and your goal")
-    st.write("You can either pick a preset **or** just write freely. I’ll interpret and build a plan.")
-    pres = st.pills("Quick presets", GOAL_PRESETS, selection_mode="single") if hasattr(st, "pills") else st.selectbox("Quick presets", ["(none)"] + GOAL_PRESETS)
-    preset = None if (isinstance(pres, str) and pres == "(none)") else (pres if isinstance(pres,str) else (pres[0] if pres else None))
-
-    free = st.text_area("Type here", height=140, placeholder=EXAMPLE_PROMPTS[0])
-
     c1, c2 = st.columns([1,3])
     with c1:
         go = st.button("Create my plan", type="primary")
