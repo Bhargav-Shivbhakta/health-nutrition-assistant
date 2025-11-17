@@ -7,11 +7,7 @@
 # - Home (main-pane wizard), Analysis (visuals), Chat (GPT-style, nutrition-only)
 # - LLM assists with plan explanations & parsing preferences if OPENAI_API_KEY set
 # =============================================================================
-# --- Streamlit rerun compat ---
-try:
-    _RERUN = st.rerun  # Streamlit >= 1.27
-except AttributeError:          # older versions
-    _RERUN = st.experimental_rerun
+
 
 from __future__ import annotations
 
@@ -29,6 +25,11 @@ import faiss
 import altair as alt
 from sentence_transformers import SentenceTransformer
 
+# --- Streamlit rerun compat ---
+try:
+    _RERUN = st.rerun  # Streamlit >= 1.27
+except AttributeError:          # older versions
+    _RERUN = st.experimental_rerun
 # ---------------------------
 # Page config & Navigation
 # ---------------------------
