@@ -71,11 +71,6 @@ GOAL_PRESETS = [
     "Plant-based endurance (higher carbs)",
 ]
 
-EXAMPLE_PROMPTS = [
-    "I'm 24, male, 176 cm, 72 kg, moderately active. I want to lose ~10% weight in 3 months, high-protein vegetarian, low sodium.",
-    "Female, 165 cm, 60 kg, light activity. Maintain weight, Mediterranean style, keep sugar under 40 g.",
-    "Male, 180 cm, 82 kg, active. Muscle gain, avoid shellfish and peanuts, under 2300 mg sodium.",
-]
 
 def _coerce_sex(s: str) -> str:
     s = (s or "").lower()
