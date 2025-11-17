@@ -29,6 +29,35 @@ def _openai_client_safe():
         pass
     return None
 
+# --- FALLBACKS so Section 0 can run even if Section 2 is below ---
+try:
+    _ = tdee_msj  # type: ignore[name-defined]
+except NameError:
+    def tdee_msj(age, sex, height_cm, weight_kg, activity):
+        s = 5 if (str(sex).lower() == "male") else -161
+        bmr = 10*float(weight_kg) + 6.25*float(height_cm) - 5*int(age) + s
+        factors = {"sedentary":1.2, "light":1.375, "moderate":1.55, "active":1.725, "athlete":1.9}
+        return bmr * factors.get(str(activity).lower(), 1.55)
+
+try:
+    _ = macro_targets  # type: ignore[name-defined]
+except NameError:
+    def macro_targets(calories: int, style: str):
+        if style == "high_protein":
+            pct = {"p": 0.30, "f": 0.25, "c": 0.45}
+        elif style == "low_carb":
+            pct = {"p": 0.30, "f": 0.40, "c": 0.30}
+        else:
+            pct = {"p": 0.25, "f": 0.30, "c": 0.45}
+        cal = int(calories)
+        return {
+            "calories": cal,
+            "protein_g": round(cal * pct["p"] / 4, 1),
+            "fat_g":     round(cal * pct["f"] / 9, 1),
+            "carb_g":    round(cal * pct["c"] / 4, 1),
+        }
+
+
 GOAL_PRESETS = [
     "Weight loss, high-protein, low sodium",
     "Muscle gain, high-protein, moderate carbs",
