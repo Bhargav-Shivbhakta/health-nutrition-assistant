@@ -185,10 +185,6 @@ if not st.session_state.onboarded:
     pres = st.pills("Quick presets", GOAL_PRESETS, selection_mode="single") if hasattr(st, "pills") else st.selectbox("Quick presets", ["(none)"] + GOAL_PRESETS)
     preset = None if (isinstance(pres, str) and pres == "(none)") else (pres if isinstance(pres,str) else (pres[0] if pres else None))
 
-    st.markdown("**Examples**")
-    for ex in EXAMPLE_PROMPTS:
-        st.code(ex)
-
     free = st.text_area("Type here", height=140, placeholder=EXAMPLE_PROMPTS[0])
 
     c1, c2 = st.columns([1,3])
